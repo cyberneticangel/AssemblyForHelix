@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""Show the assembly a compiler generates for a range of source lines.
+
+    asm-view FILE [LINE [END]] [-O LEVEL] [--exact] [-o OUT | --tmp] [--rerun]
+
+With one LINE (or LINE == END) the range grows to the whole function that
+contains it, using the compiler's own line tables. --exact turns that off.
+With -o (or --tmp, which picks a new file each time) the result, or the
+compiler error, is written to a file whose path is printed, and the exit
+status is 0, so Helix can do `:vsplit %sh{asm-view --tmp ...}`. Passing such
+a --tmp output back as FILE re-runs whatever produced it, e.g. at a new -O.
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+LEVELS = ["0", "1", "2", "3", "s"]
+
+LANGS = {
+    ".c": "c",
+    ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp", ".c++": "cpp", ".C": "cpp",
+    ".m": "objc",
+    ".mm": "objcpp",
+    ".rs": "rust",
+    ".zig": "zig",
+    ".go": "go",
+    ".f": "fortran", ".for": "fortran", ".f90": "fortran", ".f95": "fortran",
+    ".f03": "fortran", ".f08": "fortran", ".F": "fortran", ".F90": "fortran",
+    ".d": "d",
+    ".swift": "swift",
+}
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- helpers
+
+def norm(p):
+    return os.path.realpath(os.path.expanduser(p))
+
+
+def find_up(start, name):
+    d = start
+    while True:
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def find_root(start, markers):
+    d = start
+    while True:
+        if any(os.path.exists(os.path.join(d, m)) for m in markers):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def need(tool):
+    if shutil.which(tool) is None:
+        raise Fail(f"'{tool}' not found on PATH")
+    return tool
+
+
+def sh(argv, cwd=None):
+    try:
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+    except OSError as e:
+        raise Fail(f"could not run {argv[0]}: {e}")
+
+
+_x86 = {}
+
+
+def targets_x86(probe, cwd):
+    key = probe[0]
+    if key not in _x86:
+        try:
+            r = subprocess.run(probe, cwd=cwd, capture_output=True, text=True)
+            out = r.stdout if r.returncode == 0 else ""
+        except OSError:
+            out = ""
+        _x86[key] = bool(re.search(r"x86|i\d86", out))
+    return _x86[key]
+
+
+def host_x86():
+    return bool(re.search(r"x86|amd64|i\d86", platform.machine().lower()))
+
+
+# ------------------------------------------------- C / C++ / ObjC / Fortran
+
+def db_entry(path):
+    here = os.path.dirname(path)
+    dbs = [find_up(here, "compile_commands.json")]
+    root = find_root(here, [".git", "CMakeLists.txt", "Makefile", "meson.build"])
+    if root:
+        dbs += [os.path.join(root, s, "compile_commands.json") for s in ("build", "out", "builddir")]
+    for db in dbs:
+        if not db or not os.path.isfile(db):
+            continue
+        try:
+            with open(db) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for e in data if isinstance(data, list) else []:
+            f = os.path.join(e.get("directory", "."), e.get("file", ""))
+            if norm(f) == path:
+                return e
+    return None
+
+
+DROP_PAIR = {"-o", "-MF", "-MT", "-MQ"}
+DROP = {"-c", "-MD", "-MMD", "-MP", "-S"}
+
+
+def strip_flags(args):
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in DROP_PAIR:
+            skip = True
+        elif not (a in DROP or a.startswith("-O") or re.fullmatch(r"-g\d?", a)):
+            out.append(a)
+    return out
+
+
+DEFAULT_CC = {
+    "c": ["cc", "-std=c23"],
+    "cpp": ["c++", "-std=c++23"],
+    "objc": ["clang", "-x", "objective-c"],
+    "objcpp": ["clang++", "-x", "objective-c++"],
+    "fortran": ["gfortran"],
+}
+
+
+def build_cc(path, lang, level):
+    e = db_entry(path)
+    if e:
+        args = e.get("arguments") or e.get("command", "").split()
+        argv, cwd = strip_flags(args), e.get("directory")
+    else:
+        argv, cwd = DEFAULT_CC[lang] + [path], os.path.dirname(path)
+    need(argv[0])
+    argv += ["-S", "-g", "-O" + level]
+    if targets_x86([argv[0], "-dumpmachine"], cwd):
+        argv.append("-masm=intel")
+    argv += ["-o", "-"]
+    return argv, cwd, None
+
+
+# ------------------------------------------------------------------- others
+
+def build_rust(path, level, out):
+    cargo = find_up(os.path.dirname(path), "Cargo.toml")
+    cwd = os.path.dirname(cargo or path)
+    flags = ["--emit", "asm=" + out, "-Cdebuginfo=2", "-Ccodegen-units=1", "-Copt-level=" + level]
+    if targets_x86([need("rustc"), "--print", "cfg"], cwd):
+        flags.append("-Cllvm-args=--x86-asm-syntax=intel")
+    if cargo:
+        return [need("cargo"), "rustc", "--quiet", "--"] + flags, cwd, out
+    return ["rustc", "--crate-type=lib"] + flags + [path], cwd, out
+
+
+ZIG_MODE = {"0": "Debug", "1": "ReleaseSafe", "2": "ReleaseFast", "3": "ReleaseFast", "s": "ReleaseSmall"}
+
+
+def build_zig(path, level, out):
+    # zig already emits Intel syntax on x86
+    argv = [need("zig"), "build-obj", path, "-femit-asm=" + out, "-fno-emit-bin", "-fno-strip",
+            "-O", ZIG_MODE[level]]
+    return argv, os.path.dirname(path), out
+
+
+def build_go(path, level):
+    flags = "-S" if level != "0" else "-S -N -l"
+    # in a module, build the whole package so sibling files resolve;
+    # outside one, just this file. -S output goes to stderr.
+    target = "." if find_up(os.path.dirname(path), "go.mod") else path
+    return [need("go"), "build", "-o", os.devnull, "-gcflags=" + flags, target], os.path.dirname(path), None
+
+
+def build_d(path, level, out):
+    opt = {"0": "-O0", "s": "-Os"}.get(level, "-O" + level)
+    argv = [need("ldc2"), "-output-s", "-of=" + out, "-g", opt]
+    if host_x86():
+        argv.append("--x86-asm-syntax=intel")
+    return argv + [path], os.path.dirname(path), out
+
+
+def build_swift(path, level, out):
+    opt = {"0": "-Onone", "s": "-Osize"}.get(level, "-O")
+    argv = [need("swiftc"), "-S", "-g", opt, "-parse-as-library", "-o", out]
+    if host_x86():
+        argv += ["-Xllvm", "--x86-asm-syntax=intel"]
+    return argv + [path], os.path.dirname(path), out
+
+
+def build(path, lang, level, tmp):
+    out = os.path.join(tmp, "out.s")
+    if lang in DEFAULT_CC:
+        return build_cc(path, lang, level)
+    if lang == "rust":
+        return build_rust(path, level, out)
+    if lang == "zig":
+        return build_zig(path, level, out)
+    if lang == "go":
+        return build_go(path, level)
+    if lang == "d":
+        return build_d(path, level, out)
+    if lang == "swift":
+        return build_swift(path, level, out)
+    raise Fail(f"no backend for '{lang}'")
+
+
+# ------------------------------------------------------------------ parsing
+#
+# Both parsers return a list of items:
+#   ("fn", name) | ("src", line) | ("label", name) | ("insn", text)
+# where "src" items only appear for lines of *our* file.
+
+def parse_gas(lines, path):
+    base = os.path.basename(path)
+    ids, seen = set(), False
+    for l in lines:
+        m = re.match(r'\s*\.file\s+(\d+)\s+(.*)$', l)
+        if m:
+            seen = True
+            names = re.findall(r'"([^"]*)"', m.group(2))
+            if not names:
+                continue
+            full = os.path.join(*names) if len(names) > 1 else names[-1]
+            if (os.path.isabs(full) and norm(full) == path) or os.path.basename(full) == base:
+                ids.add(int(m.group(1)))
+    if not seen or not ids:
+        ids = {1}
+
+    items, ours = [], False
+    for l in lines:
+        m = re.match(r'\s*\.loc\s+(\d+)\s+(\d+)', l)
+        if m:
+            ours = int(m.group(1)) in ids
+            items.append(("src", int(m.group(2))) if ours else ("other", None))
+            continue
+        m = re.match(r'"?([\w$.@][\w$.@]*)"?:', l)
+        if m:
+            name = m.group(1)
+            items.append(("label", name) if name.startswith(".") else ("fn", name))
+        elif l.strip() and not l.lstrip().startswith((".", "#", "//", ";")) and not re.match(r'\S+\s*=', l):
+            items.append(("insn", " ".join(l.split())))
+    return items
+
+
+GO_INSN = re.compile(r'\s+0x[0-9a-f]+\s+(\d+)\s+\((.+):(\d+)\)\s+(\S+)\s*(.*)$')
+GO_FN = re.compile(r'(\S+) STEXT')
+GO_SKIP = {"TEXT", "FUNCDATA", "PCDATA"}
+
+
+def parse_go(lines, path):
+    items, cur = [], None
+    for l in lines:
+        m = GO_FN.match(l)
+        if m:
+            items.append(("fn", m.group(1)))
+            cur = None
+            continue
+        m = GO_INSN.match(l)
+        if not m:
+            continue
+        off, f, ln, op, rest = m.groups()
+        if op in GO_SKIP:
+            continue
+        mine = norm(os.path.join(os.path.dirname(path), f)) == path
+        key = (mine, int(ln))
+        if key != cur:
+            items.append(("src", int(ln)) if mine else ("other", None))
+            cur = key
+        items.append(("insn", f"{int(off):05d}  {op:<8}{rest}".rstrip()))
+    return items
+
+
+# ---------------------------------------------------------------- selection
+
+def fn_ranges(items):
+    """{fn: (first_line, last_line)}: from the line the function's code starts
+    at (its declaration) to the furthest line of ours below that."""
+    out, fn = {}, None
+    for kind, v in items:
+        if kind == "fn":
+            fn = v
+        elif kind == "src" and fn:
+            lo, hi = out.get(fn, (v, v))
+            if v >= lo:
+                out[fn] = (lo, max(hi, v))
+    return out
+
+
+def enclosing(items, line):
+    """Innermost function(s) whose range holds line, plus that range."""
+    ranges = fn_ranges(items)
+    hits = [r for r in ranges.values() if r[0] <= line <= r[1]]
+    if not hits:
+        return None, None
+    best = min(hits, key=lambda r: r[1] - r[0])
+    return {f for f, r in ranges.items() if r == best}, best
+
+
+def demangler(names):
+    names = sorted(set(names))
+    out = {n: n for n in names}
+    tool = shutil.which("c++filt")
+    mangled = [n for n in names if n.startswith(("_Z", "__Z", "_R"))]
+    if tool and mangled:
+        r = subprocess.run([tool, "--no-strip-underscore"], input="\n".join(mangled),
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            for n, d in zip(mangled, r.stdout.splitlines()):
+                out[n] = re.sub(r"::h[0-9a-f]{16}$", "", d.strip()) or n
+    tool = shutil.which("swift-demangle")
+    swift = [n for n in names if n.startswith(("$s", "_$s"))]
+    if tool and swift:
+        r = subprocess.run([tool, "--simplified", "--compact"], input="\n".join(swift),
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            for n, d in zip(swift, r.stdout.splitlines()):
+                out[n] = d.strip() or n
+    return out
+
+
+def render(items, src, l1, l2, fns=None):
+    """Range mode (fns is None): code for our lines l1..l2, wherever it lives.
+    Function mode: every instruction of the functions in fns."""
+    picked, fn, inside, prev = [], None, False, None
+    for kind, v in items:
+        if kind == "fn":
+            fn, prev = v, None
+            if fns is not None:
+                inside = fn in fns
+        elif kind == "src":
+            if fns is None:
+                inside = l1 <= v <= l2
+            if inside and v != prev:
+                picked.append(("src", v, fn))
+                prev = v
+        elif kind == "other":
+            if fns is None:
+                inside = False
+            elif inside and prev != "other":
+                picked.append(("src", None, fn))
+            prev = "other"
+        elif inside:
+            picked.append((kind, v, fn))
+
+    refd = set()
+    for kind, v, _ in picked:
+        if kind == "insn":
+            refd.update(re.findall(r"[.\w$@]+", v))
+
+    names = demangler(f for _, _, f in picked if f)
+    out, shown, last_src = [], None, None
+    for kind, v, f in picked:
+        if kind == "src":
+            if f and f != shown:
+                if out:
+                    out.append("")
+                out.append(names[f] + ":")
+                shown, last_src = f, None
+            if v == last_src:
+                continue
+            if v is None:
+                out.append("  ; (inlined from another file)")
+            else:
+                text = src[v - 1].strip() if 0 < v <= len(src) else ""
+                out.append(f"  ; {v} | {text}")
+            last_src = v
+        elif kind == "label":
+            if v in refd:
+                out.append(f"    {v}:")
+        else:
+            out.append(f"        {v}")
+            last_src = None
+    return out
+
+
+EMPTY_HINT = {
+    "rust": [
+        "; at -O a Rust-ABI `pub fn` in an rlib emits no asm — its body",
+        "; ships as MIR for cross-crate inlining instead.",
+        "; give it a call site, mark it #[no_mangle], or try -O0.",
+    ],
+    "zig": [
+        "; zig only compiles what is reachable from an `export fn`",
+        "; (or `pub fn main`). export the function, or call it from one.",
+    ],
+    "go": [
+        "; the function may have been inlined into its callers; try -O0.",
+    ],
+}
+
+
+# ---------------------------------------------------------------------- main
+
+def run(args):
+    path = norm(args.file)
+    if not os.path.isfile(path):
+        raise Fail(f"{args.file}: no such file")
+    lang = args.lang or LANGS.get(os.path.splitext(path)[1])
+    if not lang:
+        raise Fail(f"don't know how to compile '{os.path.basename(path)}' "
+                   f"(supported: {', '.join(sorted(set(LANGS.values())))})")
+
+    with open(path, errors="replace") as f:
+        src = f.read().splitlines()
+
+    with tempfile.TemporaryDirectory(prefix="asm-view-") as tmp:
+        argv, cwd, outfile = build(path, lang, args.O, tmp)
+        r = sh(argv, cwd)
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout or "compile failed").strip()
+            raise Fail(msg.replace(path, os.path.basename(path)))
+        if lang == "go":
+            asm = r.stderr.splitlines()
+        elif outfile:
+            try:
+                with open(outfile, errors="replace") as f:
+                    asm = f.read().splitlines()
+            except OSError:
+                asm = []
+        else:
+            asm = r.stdout.splitlines()
+
+    items = parse_go(asm, path) if lang == "go" else parse_gas(asm, path)
+
+    l1 = args.line or 1
+    l2 = args.end or (l1 if args.line else len(src))
+    if l1 > l2:
+        l1, l2 = l2, l1
+    fns = None
+    if l1 == l2 and not args.exact:
+        fns, rng = enclosing(items, l1)
+        if fns:
+            l1, l2 = rng
+
+    body = render(items, src, l1, l2, fns)
+    head = f"; {os.path.basename(path)}:{l1}-{l2}  -O{args.O}  ({lang})"
+    if not body:
+        body = [f"; nothing maps to lines {l1}-{l2}"]
+        hint = EMPTY_HINT.get(lang)
+        if hint and not (lang == "rust" and args.O == "0"):
+            body += [";"] + hint
+    return [head, ""] + body
+
+
+OUT_DIR = os.path.join(tempfile.gettempdir(), f"asm-view-{os.getuid()}")
+
+
+def meta_path(out):
+    return out + ".json"
+
+
+def follow(args):
+    """If FILE is an earlier asm-view output, aim at what produced it."""
+    try:
+        with open(meta_path(norm(args.file))) as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        if args.rerun:
+            raise Fail(f"{os.path.basename(args.file)} is not asm-view output")
+        return
+    args.file, args.line, args.end = meta["file"], meta["line"], meta["end"]
+    args.exact, args.lang = meta["exact"], meta["lang"]
+    args.O = args.O or meta["O"]
+
+
+def fresh_out(args):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    now = time.time()
+    for name in os.listdir(OUT_DIR):  # tidy up after a day
+        f = os.path.join(OUT_DIR, name)
+        try:
+            if now - os.path.getmtime(f) > 86400:
+                os.remove(f)
+        except OSError:
+            pass
+    stem = f"{os.path.basename(args.file)}-L{args.line or 1}-O{args.O}"
+    n = 1
+    while os.path.exists(os.path.join(OUT_DIR, f"{stem}-{n}.asm")):
+        n += 1
+    return os.path.join(OUT_DIR, f"{stem}-{n}.asm")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="asm-view", description=__doc__.split("\n")[0])
+    p.add_argument("file", help="source file, or an earlier --tmp output to re-run it")
+    p.add_argument("line", nargs="?", type=int, help="first line (1-based); alone = enclosing function")
+    p.add_argument("end", nargs="?", type=int, help="last line (inclusive)")
+    p.add_argument("-O", choices=LEVELS, help="optimisation level (default 2)")
+    p.add_argument("--exact", action="store_true", help="don't grow a single line to its function")
+    p.add_argument("--lang", choices=sorted(set(LANGS.values())), help="override detection by extension")
+    out = p.add_mutually_exclusive_group()
+    out.add_argument("-o", dest="out", help="write to this file, print its path, always exit 0")
+    out.add_argument("--tmp", action="store_true",
+                     help="like -o, into a new file under " + OUT_DIR)
+    p.add_argument("--rerun", action="store_true",
+                   help="FILE must be an earlier --tmp output; fail otherwise")
+    args = p.parse_args()
+
+    try:
+        follow(args)
+    except Fail as e:
+        print("asm-view: " + str(e), file=sys.stderr)
+        return 1
+    args.O = args.O or "2"
+
+    try:
+        lines, code = run(args), 0
+    except Fail as e:
+        lines, code = ["; asm-view: " + l if i == 0 else "; " + l
+                       for i, l in enumerate(str(e).splitlines())], 1
+
+    text = "\n".join(lines) + "\n"
+    if args.tmp:
+        args.out = fresh_out(args)
+        with open(meta_path(args.out), "w") as f:
+            json.dump({"file": norm(args.file), "line": args.line, "end": args.end,
+                       "exact": args.exact, "lang": args.lang, "O": args.O}, f)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(text)
+        print(args.out)
+        return 0
+    (sys.stdout if code == 0 else sys.stderr).write(text)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
